@@ -115,7 +115,7 @@ class _GenericConstraint(torch.nn.Module):
 
     def _apply_blocklist(self, candidate_ids, ignore_cases=True, exact_matches=False):
         if len(self.blocklist) > 0:
-            vocab_lookup = {val: key for key, val in self.tokenizer.vocab.items()}
+            vocab_lookup = {val: key for key, val in self.tokenizer.get_vocab().items()}
             valid_ids, blocked_keys = [], []
             for idx in candidate_ids:
                 key = vocab_lookup[idx]
@@ -210,7 +210,7 @@ class AsciiConstraint(_GenericConstraint):
         else:
             vocab_lookup_without_whitespace = {
                 val: key
-                for key, val in tokenizer.vocab.items()
+                for key, val in tokenizer.get_vocab().items()
                 if is_ascii(key.replace(whitespace_unicodes[0], "").replace(whitespace_unicodes[1], ""))
             }
             ascii_tokens = list(vocab_lookup_without_whitespace.keys())
@@ -229,13 +229,15 @@ class ChineseConstraint(_GenericConstraint):
     def __init__(self, tokenizer, embedding, num_tokens=8, blocklist=[]):
         super().__init__(tokenizer, embedding, num_tokens, blocklist)
 
+        self.cjk_match = re.compile("[\u4e00-\u9fff\uff00-\uffef\u3000-\u303f]")
+
         def is_zh(str_in):
-            return re.search("[\u4e00-\u9fff]", str_in)
+            return re.search(self.cjk_match, str_in)
 
         vocab_lookup_without_whitespace = {
             val: key
-            for key, val in tokenizer.vocab.items()
-            if is_zh(key.replace(whitespace_unicodes[0], "").replace(whitespace_unicodes[1], ""))
+            for key, val in tokenizer.get_vocab().items()
+            if is_zh(tokenizer.decode[val])
         }
         zh_tokens = list(vocab_lookup_without_whitespace.keys())
         self.register_buffer("zh_tokens", torch.as_tensor(sorted(self._apply_blocklist(zh_tokens))), persistent=False)
@@ -250,12 +252,13 @@ class CharConstraint(_GenericConstraint):
 
     def __init__(self, tokenizer, embedding, num_tokens=8, blocklist=[], include_whitespaces=False, only_ascii=True):
         super().__init__(tokenizer, embedding, num_tokens, blocklist)
+        vocab = tokenizer.get_vocab()
         if include_whitespaces:
-            letter_tokens = {val: key for key, val in tokenizer.vocab.items() if len(key.replace(chr(288), "")) == 1}
+            letter_tokens = {val: key for key, val in vocab.items() if len(key.replace(chr(288), "")) == 1}
         elif only_ascii:
-            letter_tokens = {val: key for key, val in tokenizer.vocab.items() if len(key) == 1 and is_ascii(key)}
+            letter_tokens = {val: key for key, val in vocab.items() if len(key) == 1 and is_ascii(key)}
         else:
-            letter_tokens = {val: key for key, val in tokenizer.vocab.items() if len(key) == 1}
+            letter_tokens = {val: key for key, val in vocab.items() if len(key) == 1}
         self.register_buffer("letter_tokens", torch.as_tensor(sorted(self._apply_blocklist(list(letter_tokens.keys())))), persistent=False)
 
     @property
@@ -269,7 +272,7 @@ class LetterConstraint(_GenericConstraint):
     def __init__(self, tokenizer, embedding, num_tokens=8, blocklist=[]):
         super().__init__(tokenizer, embedding, num_tokens, blocklist)
         allowed_ordinals = [*range(48, 58), *range(65, 91), *range(96, 123)]
-        letter_tokens = {val: key for key, val in tokenizer.vocab.items() if len(key) == 1 and ord(key) in allowed_ordinals}
+        letter_tokens = {val: key for key, val in tokenizer.get_vocab().items() if len(key) == 1 and ord(key) in allowed_ordinals}
         self.register_buffer("letter_tokens", torch.as_tensor(sorted(self._apply_blocklist(list(letter_tokens.keys())))), persistent=False)
 
     @property
@@ -285,7 +288,7 @@ class NumberConstraint(_GenericConstraint):
         allowed_nums = [str(num) for num in range(0, 9)]
         number_tokens = {
             val: key
-            for key, val in tokenizer.vocab.items()
+            for key, val in tokenizer.get_vocab().items()
             if key.replace(whitespace_unicodes[0], "").replace(whitespace_unicodes[1], "") in allowed_nums
         }
         self.register_buffer("number_tokens", torch.as_tensor(sorted(self._apply_blocklist(list(number_tokens.keys())))), persistent=False)
@@ -301,7 +304,7 @@ class NonLatinConstraint(_GenericConstraint):
     def __init__(self, tokenizer, embedding, num_tokens=8, blocklist=[]):
         super().__init__(tokenizer, embedding, num_tokens, blocklist)
         all_letters = {chr(x) for x in [*range(48, 58), *range(65, 91), *range(96, 123)]}
-        allowed_tokens = {val: key for key, val in tokenizer.vocab.items() if not any(kchr in all_letters for kchr in key)}
+        allowed_tokens = {val: key for key, val in tokenizer.get_vocab().items() if not any(kchr in all_letters for kchr in key)}
         self.register_buffer(
             "allowed_tokens", torch.as_tensor(sorted(self._apply_blocklist(list(allowed_tokens.keys())))), persistent=False
         )
@@ -316,7 +319,7 @@ class UnwordConstraint(_GenericConstraint):
 
     def __init__(self, tokenizer, embedding, num_tokens=8, blocklist=[]):
         super().__init__(tokenizer, embedding, num_tokens, blocklist)
-        allowed_tokens = {val: key for key, val in tokenizer.vocab.items() if not any(kchr.isalpha() for kchr in key)}
+        allowed_tokens = {val: key for key, val in tokenizer.get_vocab().items() if not any(kchr.isalpha() for kchr in key)}
         self.register_buffer(
             "allowed_tokens", torch.as_tensor(sorted(self._apply_blocklist(list(allowed_tokens.keys())))), persistent=False
         )
@@ -334,14 +337,14 @@ class WordConstraint(_GenericConstraint):
         if only_ascii:
             allowed_tokens = {
                 val: key
-                for key, val in tokenizer.vocab.items()
+                for key, val in tokenizer.get_vocab().items()
                 if all(
                     kchr.isalpha() and kchr.isascii()
                     for kchr in key.replace(whitespace_unicodes[0], "").replace(whitespace_unicodes[1], "").strip(" ")  # quick and dirty
                 )
             }
         else:
-            allowed_tokens = {val: key for key, val in tokenizer.vocab.items() if all(kchr.isalpha() for kchr in key)}
+            allowed_tokens = {val: key for key, val in tokenizer.get_vocab().items() if all(kchr.isalpha() for kchr in key)}
         self.register_buffer(
             "allowed_tokens", torch.as_tensor(sorted(self._apply_blocklist(list(allowed_tokens.keys())))), persistent=False
         )
@@ -412,8 +415,9 @@ class SimpleZalgoConstraint(_GenericNonUniformConstraint):
         self.group_size = group_size
 
         if deconstruct_skeleton:
-            skeleton_ids = [tokenizer.vocab[s] for s in skeleton]
-            skeleton_ids[0] = tokenizer.vocab[whitespace_unicodes[0] + skeleton[0]]  # why llama????????
+            vocab = tokenizer.get_vocab()
+            skeleton_ids = [vocab[s] for s in skeleton]
+            skeleton_ids[0] = vocab[whitespace_unicodes[0] + skeleton[0]]  # why llama????????
         else:
             skeleton_ids = tokenizer(skeleton, add_special_tokens=False)["input_ids"]
         num_token_fits_test = (num_tokens - len(skeleton_ids)) % (group_size * len(skeleton_ids))
@@ -510,7 +514,7 @@ class RunicConstraint(_GenericNonUniformConstraint):
         )
 
         sets_per_idx = []
-        sets_per_idx.append([tokenizer.vocab["▁"]])  # llammaaaaaaaaaaaaaaa
+        sets_per_idx.append([tokenizer.get_vocab()["▁"]])  # llammaaaaaaaaaaaaaaa
         for group in range(num_tokens // assumed_group_size):
             selected_codepoint = random.choices(list(counter.keys()), weights=counter.values())[0]
             for fixed_codepoint in selected_codepoint:
@@ -593,7 +597,7 @@ class FullChineseConstraint(RunicConstraint):
         )
 
         sets_per_idx = []
-        sets_per_idx.append([tokenizer.vocab["▁"]])  # llammaaaaaaaaaaaaaaa
+        sets_per_idx.append([tokenizer.get_vocab()["▁"]])  # llammaaaaaaaaaaaaaaa
         for group in range(num_tokens // group_size):
             selected_codepoint = random.choices(list(counter.keys()), weights=counter.values())[0]
             for fixed_codepoint in selected_codepoint:
