@@ -224,20 +224,16 @@ class _GenericSigil(torch.nn.Module):
     def _maybe_load_cache(self, embeddings, mask, pos_ids):
         if self.model.attempt_to_cache_fixed_tokens:
             if self._cache is None:
+                cache = transformers.DynamicCache(config=self.model.config)
                 # Build cache:
                 with torch.no_grad():
-                    self.model.eval()  # disable grad checkpointing
-                    # checkpointing shouldn't be tied to the model's .training attribute, but apparently it is
-                    past_key_values = self.model(inputs_embeds=embeddings, attention_mask=mask, use_cache=True)["past_key_values"]
-                    self.model.train()  # enable grad checkpointing
-                # Cut past_kv_values to size:
-                past_key_values = tuple(
-                    tuple(block[:, :, : self.last_fixed_token_pos, :].detach() for block in layer) for layer in past_key_values
-                )
-                self._cache = past_key_values  # = DynamicCache.from_legacy_cache(past_key_values) # broken in combination with cp
+                    outputs = self.model(inputs_embeds=embeddings[:, : self.last_fixed_token_pos, :], attention_mask=mask, use_cache=True, past_key_values=cache)
+                self._cache = outputs.past_key_values
                 # Correct all indices involved in the objective calcuation to new shifted positions
                 if hasattr(self, "loss_indices"):
                     self.loss_indices = self.loss_indices - self.last_fixed_token_pos if self.loss_indices is not None else None
+            else:
+                self._cache.crop(self.last_fixed_token_pos)
             cache = self._cache
             embeddings = embeddings[:, self.last_fixed_token_pos :, :]
             if pos_ids is not None:

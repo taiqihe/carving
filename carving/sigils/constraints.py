@@ -237,7 +237,7 @@ class ChineseConstraint(_GenericConstraint):
         vocab_lookup_without_whitespace = {
             val: key
             for key, val in tokenizer.get_vocab().items()
-            if is_zh(tokenizer.decode[val])
+            if is_zh(tokenizer.decode([val]))
         }
         zh_tokens = list(vocab_lookup_without_whitespace.keys())
         self.register_buffer("zh_tokens", torch.as_tensor(sorted(self._apply_blocklist(zh_tokens))), persistent=False)

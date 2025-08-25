@@ -35,7 +35,7 @@ default_precision: float16
 # requires bnb:
 load_in_8bit: False
 # doesn't work for all models:
-grad_checkpointing: True
+grad_checkpointing: False
 use_flash_attention_2: False # Turn this on, once you have FA2 installed and working
 use_kv_caching: True
 

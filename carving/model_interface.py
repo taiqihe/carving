@@ -37,13 +37,13 @@ def load_model_and_tokenizer(
         )
         if cfg_impl["use_flash_attention_2"] and setup["dtype"] in [torch.float16, torch.bfloat16]:
             config._supports_flash_attn_2 = True
-            config = LlamaPreTrainedModel._check_and_enable_flash_attn_2(config, torch_dtype=setup["dtype"], device_map=None)
-        model = AutoModelForCausalLM.from_config(config, torch_dtype=setup["dtype"])
+            config = LlamaPreTrainedModel._check_and_enable_flash_attn_2(config, dtype=setup["dtype"], device_map=None)
+        model = AutoModelForCausalLM.from_config(config, dtype=setup["dtype"])
     else:
         # Load actual models:
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True, use_fast=True, local_files_only=False)
 
-        model_args = dict(trust_remote_code=True, low_cpu_mem_usage=True, torch_dtype=setup["dtype"], use_cache=False)
+        model_args = dict(trust_remote_code=True, low_cpu_mem_usage=True, dtype=setup["dtype"], use_cache=False)
         if "llama" in model_name_or_path.lower() or "falcon" in model_name_or_path.lower() or "zephyr" in model_name_or_path.lower():
             if setup["dtype"] in [torch.float16, torch.bfloat16] and cfg_impl["use_flash_attention_2"]:
                 model_args |= dict(use_flash_attention_2=True)  # dict(attn_implementation="flash_attention_2") only on later releases
@@ -83,16 +83,17 @@ def load_model_and_tokenizer(
     # The actual padding type is "with holes", due to the way the prompts are batched
     # This is handled explicitly in the attention mask and input ids, so here we're just working to disable huggingface warnings:
     tokenizer.padding_side = "right"
-    if tokenizer._pad_token is None:  # using the private attribute to get around an annoying warning
-        if tokenizer._unk_token is None:
-            # if "qwen" in model_name_or_path.lower():
-            #     # exception for qwen tokenizer
-            #     tokenizer._pad_token = "<|extra_0|>"
-            # else:
-            # otherwise attempt this:
-            tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
-        else:
-            tokenizer.add_special_tokens({"pad_token": tokenizer.unk_token})
+    if hasattr(tokenizer, "_pad_token"):
+        if tokenizer._pad_token is None:  # using the private attribute to get around an annoying warning
+            if tokenizer._unk_token is None:
+                # if "qwen" in model_name_or_path.lower():
+                #     # exception for qwen tokenizer
+                #     tokenizer._pad_token = "<|extra_0|>"
+                # else:
+                # otherwise attempt this:
+                tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
+            else:
+                tokenizer.add_special_tokens({"pad_token": tokenizer.unk_token})
     # Try this fix to rescue some 3rd-party tokenizers:
     # if not hasattr(tokenizer, "vocab"):
     #     tokenizer.vocab = tokenizer.get_vocab()
