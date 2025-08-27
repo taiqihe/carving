@@ -59,11 +59,19 @@ class _GenericSigil(torch.nn.Module):
         self.embedding = retrieve_embedding(model)
 
         self.constraint = get_constraint(constraint, tokenizer, self.embedding, num_tokens, blocklist=constraint_blocklist)
-        if len(self.constraint) == 0:
+        n_constraint_toks = len(self.constraint)
+        if n_constraint_toks == 0:
             raise ValueError("Constraint set too restrictive for the given tokenizer. No valid tokens could be identified.")
         else:
-            print(f"Optimizing over constraint set with {len(self.constraint)} tokens.")
+            print(f"Optimizing over constraint set with {n_constraint_toks} tokens.")
         self.tokenizer = _add_placeholder_tokens(tokenizer)
+
+        self.id_map_to_constraint = torch.zeros(self.embedding.num_embeddings, dtype=torch.int32) - 1
+        self.id_map_to_model = self.constraint.set.clone()
+        for i, tid in enumerate(self.constraint.set):
+            self.id_map_to_constraint[tid] = i
+        const_emb_mat = torch.take_along_dim(self.embedding.weight, self.constraint.set.unsqueeze(1), dim=0)
+        self.constraint_embeddings = torch.nn.Embedding.from_pretrained(const_emb_mat)
 
         if objective == "reverse-xent":
             self.loss_fn = ReverseCrossEntropyLoss(reduction="none", ignore_index=tokenizer.pad_token_id)
@@ -86,15 +94,16 @@ class _GenericSigil(torch.nn.Module):
 
         self.num_tokens = num_tokens
         self.num_embeddings = self.embedding.num_embeddings
+        self.num_constraint_embeddings = n_constraint_toks
         self.natural_prompt = natural_prompt
-        self._cache = None
+        self._cache = {"one": None, "batched": None}
         self._state_cache = dict()
 
     def _set_argument_uid(self, args_and_kwargs):
         """Return hash of own arguments."""
         return hash_args(args_and_kwargs)
 
-    def objective(self, inputs_embeds=None, input_ids=None, state=None, mask_source=None):
+    def objective(self, inputs_embeds=None, input_ids=None, state=None, mask_source=None, mapped=False):
         if mask_source is not None:
             mask = mask_source != self.tokenizer.pad_token_id
         elif input_ids is not None:
@@ -102,7 +111,10 @@ class _GenericSigil(torch.nn.Module):
         else:
             mask = None
         if input_ids is not None and inputs_embeds is None:
-            inputs_embeds = self.embedding(input_ids)
+            if mapped:
+                inputs_embeds = self.constraint_embeddings(input_ids)
+            else:
+                inputs_embeds = self.embedding(input_ids)
         return self._objective_impl(inputs_embeds, state=state, mask=mask)
 
     @property
@@ -223,24 +235,42 @@ class _GenericSigil(torch.nn.Module):
 
     def _maybe_load_cache(self, embeddings, mask, pos_ids):
         if self.model.attempt_to_cache_fixed_tokens:
-            if self._cache is None:
+            if embeddings.shape[0] == 1:
+                cache_ver = "one"
+            else:
+                cache_ver = "batched"
+            if self._cache[cache_ver] is None:
                 cache = transformers.DynamicCache(config=self.model.config)
                 # Build cache:
                 with torch.no_grad():
-                    outputs = self.model(inputs_embeds=embeddings[:, : self.last_fixed_token_pos, :], attention_mask=mask, use_cache=True, past_key_values=cache)
-                self._cache = outputs.past_key_values
+                    outputs = self.model(
+                        inputs_embeds=embeddings[:, : self.last_fixed_token_pos, :],
+                        attention_mask=mask,
+                        use_cache=True,
+                        past_key_values=cache,
+                    )
+                self._cache[cache_ver] = outputs.past_key_values
                 # Correct all indices involved in the objective calcuation to new shifted positions
                 if hasattr(self, "loss_indices"):
                     self.loss_indices = self.loss_indices - self.last_fixed_token_pos if self.loss_indices is not None else None
             else:
-                self._cache.crop(self.last_fixed_token_pos)
-            cache = self._cache
+                self._cache[cache_ver].crop(self.last_fixed_token_pos)
+            cache = self._cache[cache_ver]
             embeddings = embeddings[:, self.last_fixed_token_pos :, :]
             if pos_ids is not None:
                 pos_ids = pos_ids[:, self.last_fixed_token_pos :]
             return embeddings, cache, pos_ids
         else:
             return embeddings, None, pos_ids
+    
+    def map_to_constraint_ids(self, input_ids):
+        mapped = self.id_map_to_constraint[input_ids]
+        if torch.sum(mapped < 0) > 0:
+            raise ValueError("Trying to map invalid tokens to constraint set")
+        return mapped
+
+    def map_to_tokenizer_ids(self, input_ids):
+        return self.id_map_to_model[input_ids]
 
 
 class FixedTargetSigil(_GenericSigil):
@@ -287,7 +317,7 @@ class FixedTargetSigil(_GenericSigil):
 
     def _objective_impl(self, inputs_embeds, mask=None, state=None):
         B, S, H = inputs_embeds.shape
-        embeddings = self.embedding(self.prompt_ids).detach()
+        embeddings = self.embedding(self.prompt_ids).detach().repeat(B, 1, 1)
         embeddings[:, self.attack_indices, :] = inputs_embeds
         mask, pos_ids = self._maybe_create_mask(mask, embeddings)
         embeddings, cache, pos_ids = self._maybe_load_cache(embeddings, mask, pos_ids)

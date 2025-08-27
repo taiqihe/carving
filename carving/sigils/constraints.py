@@ -87,8 +87,8 @@ class _GenericConstraint(torch.nn.Module):
     def draw_random_sequence(self, device=torch.device("cpu")):
         """Draw a random sequence from this constraint. Useful to initialize optimization."""
         prompt_ids = self.set[torch.randint(len(self), (1, self.num_tokens)).to(device)]
-        # Start with tokenizable prompt
-        prompt_ids = self.project_onto_tokenizable_ids(prompt_ids)
+        while sum(self.is_tokenization_safe(prompt_ids)) == 0:
+            prompt_ids = self.set[torch.randint(len(self), (1, self.num_tokens)).to(device)]
         return prompt_ids
 
     def gather_random_element(self, indices, locations, scores=None):

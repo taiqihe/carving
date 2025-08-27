@@ -1,0 +1,161 @@
+"""Improved GCG optimizer from Improved Techniques for Optimization-Based Jailbreaking on Large Language Models"""
+
+import itertools
+
+import numpy as np
+import torch
+
+from .generic_optimizer import _GenericOptimizer
+
+_default_setup = dict(device=torch.device("cpu"), dtype=torch.float32)
+max_retries = 20
+progress_threshold = 0.5  # only valid for progressive expansion. Hardcoded for now
+
+
+class IGCGOptimizer(_GenericOptimizer):
+    def __init__(
+        self,
+        *args,
+        setup=_default_setup,
+        save_checkpoint=False,
+        steps=500,
+        batch_size=512,
+        topk=256,
+        top_p=7,
+        temp=1,
+        patience=3,
+        filter_cand=True,
+        freeze_objective_in_search=False,
+        progressive_expansion=False,
+        **kwargs,
+    ):
+        super().__init__(setup=setup, save_checkpoint=save_checkpoint)
+        self.steps = steps
+        self.batch_size = batch_size
+        self.topk = topk
+        self.top_p = top_p
+        self.temp = temp
+        self.patience = patience
+        self.filter_cand = filter_cand
+        self.freeze_objective_in_search = freeze_objective_in_search
+        self.progressive_expansion = progressive_expansion
+        self.rng = np.random.default_rng()
+
+
+    def token_gradients(self, sigil, input_ids, state=None):
+        """
+        Computes gradients of the loss with respect to the coordinates.
+        Operating with constraint mapped indices
+        """
+        sigil.model.train()  # necessary to trick HF transformers to allow gradient checkpointing
+        # one_hot: attack_len x n_constraint_toks
+        one_hot = torch.zeros(input_ids.shape[1], sigil.num_constraint_embeddings, **self.setup)
+        one_hot.scatter_(1, input_ids[0].unsqueeze(1), 1)
+        one_hot.requires_grad_()
+        inputs_embeds = (one_hot @ sigil.constraint_embeddings.weight).unsqueeze(0)
+        adv_loss = sigil.objective(inputs_embeds=inputs_embeds, mask_source=input_ids, state=state).mean()
+        (input_ids_grads,) = torch.autograd.grad(adv_loss, [one_hot])
+        sigil.model.eval()  # necessary to trick HF transformers to disable gradient checkpointing
+        return input_ids_grads
+        # adv_loss.backward() # alternative for reentrant grad checkpointing
+        # return one_hot.grad
+
+
+    @torch.no_grad()
+    def sample_candidates(self, input_ids, grad, batch_size, topk=256):
+        """
+        We sample batch_size sequnences from topk by sampling the token position and id independently.
+        """
+        # grad: attack_len x n_constraint_toks
+        top_indices = torch.topk(-grad, k=topk, dim=-1).indices.to(input_ids.dtype) # attack_len x topk
+        
+        idxes = list(itertools.product(range(top_indices.shape[0]), range(topk)))
+        new_seq_pos, new_token_pos = torch.tensor(self.rng.choice(idxes, size=batch_size).T, device=top_indices.device, dtype=torch.int32)
+        
+        new_input_ids = input_ids.repeat(batch_size, 1)
+        new_input_ids[torch.arange(batch_size), new_seq_pos] = top_indices[new_seq_pos, new_token_pos]
+        return new_input_ids, new_seq_pos
+
+    @torch.no_grad()
+    def get_filtered_cands(self, sigil, candidate_ids):
+        if self.filter_cand:
+            candidate_ids = sigil.map_to_tokenizer_ids(candidate_ids)
+            candidate_is_valid = sigil.constraint.is_tokenization_safe(candidate_ids)
+            if sum(candidate_is_valid) > 0:
+                candidate_ids = sigil.map_to_constraint_ids(candidate_ids[candidate_is_valid])
+                return candidate_ids, True
+            else:
+                print(f"No valid candidate accepted out of {len(candidate_ids)} candidates.")
+                return candidate_ids, False
+        else:
+            return candidate_ids, True
+
+    def solve(self, sigil, initial_guess=None, initial_step=0, dryrun=False, **kwargs):
+        if len(sigil.constraint) < self.topk:
+            new_topk = len(sigil.constraint) // 2
+            print(f"Constraint space of size {len(sigil.constraint)} too small for {self.topk} topk entries. Reducing to {new_topk}.")
+            self.topk = new_topk
+
+        if self.progressive_expansion:
+            if hasattr(sigil, "progressive_expansion"):
+                sigil.progressive_expansion = True
+            else:
+                raise ValueError(f"Sigil {sigil} does not support progressive expansion.")
+
+        # Initialize solver
+        best_loss = float("inf")
+        if initial_guess is None:
+            prompt_ids = sigil.constraint.draw_random_sequence(device=self.setup["device"])
+        else:
+            if len(initial_guess) != sigil.num_tokens:
+                raise ValueError(f"Initial guess does not match expected number of tokens ({sigil.num_tokens}).")
+            else:
+                prompt_ids = torch.as_tensor(initial_guess, device=self.setup["device"]).unsqueeze(0)
+        prompt_ids = sigil.map_to_constraint_ids(prompt_ids)
+        # prompt_ids: 1 x attack_len
+
+        # print(f"Initial Prompt is: {sigil.tokenizer.decode(prompt_ids[0])}")
+        best_prompt_ids = prompt_ids.clone()
+        init_state = initial_step if self.freeze_objective_in_search else None
+        best_loss = sigil.objective(input_ids=best_prompt_ids, state=init_state).to(dtype=torch.float32).mean().item()
+
+        for iteration in range(initial_step, self.steps):
+            # Optionally freeze objective state
+            state = iteration if self.freeze_objective_in_search else None
+            if self.progressive_expansion and best_loss < progress_threshold:
+                print(f"Loss threshold reached with loss {best_loss} in step {iteration}, expanding target length.")
+                state = f"expand_{state}"
+                best_loss = float("inf")
+            # Aggregate gradients
+            grad = self.token_gradients(sigil, prompt_ids, state=state)
+            normalized_grad = grad / grad.norm(dim=-1, keepdim=True)
+
+            # Select candidates
+            for _ in range(max_retries):
+                # Sample candidates
+                candidates, changed_pos = self.sample_candidates(prompt_ids, normalized_grad, self.batch_size, self.topk)
+                # Filter candidates:
+                candidates, valid_candidates_found = self.get_filtered_cands(sigil, candidates)
+                if valid_candidates_found:
+                    break
+
+            # Search
+            loss = torch.zeros(len(candidates), dtype=torch.float32, device=self.setup["device"])
+            # print(f"Unique fwd passes: {len(unique_candidates)}")
+            with torch.no_grad():
+                loss = sigil.objective(inputs_embeds=sigil.constraint_embeddings(candidates), state=state).to(dtype=torch.float32).mean()
+
+            # Return best from batch:
+            minimal_loss_in_iteration = loss.argmin()
+            best_candidate = candidates[minimal_loss_in_iteration]
+            loss_for_best_candidate = loss[minimal_loss_in_iteration]
+
+            if loss_for_best_candidate < best_loss:
+                best_loss = loss_for_best_candidate.item()
+                best_prompt_ids = best_candidate.unsqueeze(0)
+
+            self.callback(sigil, best_candidate.unsqueeze(0), best_prompt_ids, loss_for_best_candidate.detach(), iteration, **kwargs)
+            if dryrun:
+                break
+
+        return best_prompt_ids  # always return with leading dimension

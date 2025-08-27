@@ -10,6 +10,7 @@ from .greedy_search import GreedyOptimizer
 from .random_search import RandomSearch
 from .pez import HardPromptsMadeEasyOptimizer
 from .gcg import GCGOptimizer
+from .igcg import IGCGOptimizer
 from .gcgplus import GCGPlusOptimizer
 from .lls_genetic_algorithm import LLSOptimizer
 from .sto import STOOptimizer
@@ -20,6 +21,7 @@ __all__ = [
     "RandomSearch",
     "HardPromptsMadeEasyOptimizer",
     "GCGOptimizer",
+    "IGCGOptimizer",
     "SoftPromptOptimizer",
     "LLSOptimizer",
     "STOOptimizer",
@@ -31,6 +33,7 @@ optimizer_lookup = {
     "random-search": RandomSearch,
     "pez": HardPromptsMadeEasyOptimizer,
     "gcg": GCGOptimizer,
+    "igcg": IGCGOptimizer,
     "gcg+": GCGPlusOptimizer,
     "lls-genetic-algorithm": LLSOptimizer,
     "sto": STOOptimizer,  # this also refered to as "autodan", but the name is ambiguous
