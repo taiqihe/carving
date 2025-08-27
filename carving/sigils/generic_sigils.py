@@ -13,6 +13,7 @@ from transformers import LlamaTokenizerFast, LlamaForCausalLM
 
 # from transformers.cache_utils import DynamicCache # as of 01/04 broken in combination with reentrant=False checkpointing
 from torch.nn.functional import log_softmax
+from torch.nn import CrossEntropyLoss
 
 from ..model_interface import retrieve_embedding
 from .utils import (
@@ -66,11 +67,13 @@ class _GenericSigil(torch.nn.Module):
             print(f"Optimizing over constraint set with {n_constraint_toks} tokens.")
         self.tokenizer = _add_placeholder_tokens(tokenizer)
 
+        constraint_set = self.constraint.set.to(self.embedding.weight.device)
+
         self.id_map_to_constraint = torch.zeros(self.embedding.num_embeddings, dtype=torch.int32) - 1
-        self.id_map_to_model = self.constraint.set.clone()
-        for i, tid in enumerate(self.constraint.set):
+        self.id_map_to_model = constraint_set.clone()
+        for i, tid in enumerate(constraint_set):
             self.id_map_to_constraint[tid] = i
-        const_emb_mat = torch.take_along_dim(self.embedding.weight, self.constraint.set.unsqueeze(1), dim=0)
+        const_emb_mat = torch.take_along_dim(self.embedding.weight, constraint_set.unsqueeze(1), dim=0)
         self.constraint_embeddings = torch.nn.Embedding.from_pretrained(const_emb_mat)
 
         if objective == "reverse-xent":
@@ -88,6 +91,9 @@ class _GenericSigil(torch.nn.Module):
             # minimize soft maximal cross entropy across the sequence length
             self.loss_fn = ReverseLSECrossEntropyLoss(reduction="none", ignore_index=tokenizer.pad_token_id)
             self.maximize = True
+        elif objective == "batched-ce":
+            self.loss_fn = CrossEntropyLoss(reduction="none", ignore_index=tokenizer.pad_token_id)
+            self.maximize = False
         else:
             self.loss_fn = OneDimCrossEntropyLoss(reduction="none", ignore_index=tokenizer.pad_token_id)
             self.maximize = False
@@ -98,6 +104,7 @@ class _GenericSigil(torch.nn.Module):
         self.natural_prompt = natural_prompt
         self._cache = {"one": None, "batched": None}
         self._state_cache = dict()
+        self.loss_indices_updated = False
 
     def _set_argument_uid(self, args_and_kwargs):
         """Return hash of own arguments."""
@@ -251,8 +258,9 @@ class _GenericSigil(torch.nn.Module):
                     )
                 self._cache[cache_ver] = outputs.past_key_values
                 # Correct all indices involved in the objective calcuation to new shifted positions
-                if hasattr(self, "loss_indices"):
+                if hasattr(self, "loss_indices") and not self.loss_indices_updated:
                     self.loss_indices = self.loss_indices - self.last_fixed_token_pos if self.loss_indices is not None else None
+                    self.loss_indices_updated = True
             else:
                 self._cache[cache_ver].crop(self.last_fixed_token_pos)
             cache = self._cache[cache_ver]
@@ -264,12 +272,14 @@ class _GenericSigil(torch.nn.Module):
             return embeddings, None, pos_ids
     
     def map_to_constraint_ids(self, input_ids):
+        self.id_map_to_constraint = self.id_map_to_constraint.to(input_ids.device)
         mapped = self.id_map_to_constraint[input_ids]
         if torch.sum(mapped < 0) > 0:
             raise ValueError("Trying to map invalid tokens to constraint set")
         return mapped
 
     def map_to_tokenizer_ids(self, input_ids):
+        self.id_map_to_model = self.id_map_to_model.to(input_ids.device)
         return self.id_map_to_model[input_ids]
 
 
@@ -289,7 +299,9 @@ class FixedTargetSigil(_GenericSigil):
         _progressive_expansion=False,
         **kwargs,
     ):
-        super().__init__(model, tokenizer, aux_models, *args, **kwargs)
+        if "objective" in kwargs:
+            del kwargs["objective"]
+        super().__init__(model, tokenizer, aux_models, *args, objective="batched-ce", **kwargs)
         self.context = context
         self.target = target.rstrip()  # strip trailing \n which tokenizer.apply_chat_template does not handle well
 
@@ -324,7 +336,8 @@ class FixedTargetSigil(_GenericSigil):
 
         if not self.progressive_expansion or "eval" in str(state):  # business as usual:
             target_logits = self.model(inputs_embeds=embeddings, attention_mask=mask, past_key_values=cache, position_ids=pos_ids)["logits"]
-            loss = self.loss_fn(target_logits[:, self.loss_indices], self.target_ids)
+            target_logits = target_logits[:, self.loss_indices].transpose(1,2)
+            loss = self.loss_fn(target_logits, self.target_ids.repeat(B, 1))
         else:
             loss = self._progressive_expansion_objective(embeddings, mask, cache, pos_ids, state)
 
@@ -342,7 +355,7 @@ class FixedTargetSigil(_GenericSigil):
             past_key_values=cache,
             position_ids=pos_ids[:, : -(self.target_ids.shape[1] - t)],
         )["logits"]
-        loss = self.loss_fn(target_logits[:, self.loss_indices[:t]], self.target_ids[:, :t])
+        loss = self.loss_fn(target_logits[:, self.loss_indices[:t]].transpose(1,2), self.target_ids[:, :t])
         return loss
 
     def make_prompt_with_target(self, input_ids, state=None):
