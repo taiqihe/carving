@@ -43,7 +43,7 @@ def load_model_and_tokenizer(
         # Load actual models:
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True, use_fast=True, local_files_only=False)
 
-        model_args = dict(trust_remote_code=True, low_cpu_mem_usage=True, dtype=setup["dtype"], use_cache=False)
+        model_args = dict(trust_remote_code=True, low_cpu_mem_usage=True, dtype=setup["dtype"])
         if "llama" in model_name_or_path.lower() or "falcon" in model_name_or_path.lower() or "zephyr" in model_name_or_path.lower():
             if setup["dtype"] in [torch.float16, torch.bfloat16] and cfg_impl["use_flash_attention_2"]:
                 model_args |= dict(use_flash_attention_2=True)  # dict(attn_implementation="flash_attention_2") only on later releases

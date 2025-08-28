@@ -20,6 +20,7 @@ class IGCGOptimizer(_GenericOptimizer):
         save_checkpoint=False,
         steps=500,
         batch_size=512,
+        n_batches_per_sample=1,
         topk=256,
         top_p=7,
         temp=1,
@@ -33,6 +34,7 @@ class IGCGOptimizer(_GenericOptimizer):
         super().__init__(setup=setup, save_checkpoint=save_checkpoint)
         self.steps = steps
         self.batch_size = batch_size
+        self.n_batches_per_sample = n_batches_per_sample
         self.topk = topk
         self.top_p = top_p
         self.temp = temp
@@ -42,7 +44,6 @@ class IGCGOptimizer(_GenericOptimizer):
         self.progressive_expansion = progressive_expansion
         self.compute_combined_loss = compute_combined_loss
         self.rng = np.random.default_rng()
-
 
     def token_gradients(self, sigil, input_ids, state=None):
         """
@@ -62,18 +63,19 @@ class IGCGOptimizer(_GenericOptimizer):
         # adv_loss.backward() # alternative for reentrant grad checkpointing
         # return one_hot.grad
 
-
     @torch.no_grad()
     def sample_candidates(self, input_ids, grad, batch_size, topk=256):
         """
         We sample batch_size sequnences from topk by sampling the token position and id independently.
         """
         # grad: attack_len x n_constraint_toks
-        top_indices = torch.topk(-grad, k=topk, dim=-1).indices.to(input_ids.dtype) # attack_len x topk
-        
+        top_indices = torch.topk(-grad, k=topk, dim=-1).indices.to(input_ids.dtype)  # attack_len x topk
+
         idxes = list(itertools.product(range(top_indices.shape[0]), range(topk)))
-        new_seq_pos, new_token_pos = torch.tensor(self.rng.choice(idxes, size=batch_size, replace=False).T, device=top_indices.device, dtype=torch.int32)
-        
+        new_seq_pos, new_token_pos = torch.tensor(
+            self.rng.choice(idxes, size=batch_size, replace=False).T, device=top_indices.device, dtype=torch.int32
+        )
+
         new_input_ids = input_ids.repeat(batch_size, 1)
         new_input_ids[torch.arange(batch_size), new_seq_pos] = top_indices[new_seq_pos, new_token_pos]
         return new_input_ids, new_seq_pos
@@ -90,17 +92,18 @@ class IGCGOptimizer(_GenericOptimizer):
                 return candidate_is_valid, False
         else:
             return torch.ones(candidate_ids.shape[0]), True
-    
+
     def combine_top_p_samples(self, loss, candidates, pos_changed, candidate_is_valid):
         ranking = loss.argsort()
         selections = []
         for i in ranking:
             if candidate_is_valid[i]:
-                selections.append(i)
+                selections.append(i.item())
                 if len(selections) >= self.top_p:
                     break
         combined_candidate = candidates[selections[-1]].clone()
-        for j in range(len(selections)-2, -1, -1):
+        selections = torch.tensor(selections, device=candidates.device, dtype=torch.int32)
+        for j in range(len(selections) - 2, -1, -1):
             i = selections[j]
             pos = pos_changed[i]
             combined_candidate[pos] = candidates[i][pos]
@@ -148,25 +151,34 @@ class IGCGOptimizer(_GenericOptimizer):
             grad = self.token_gradients(sigil, prompt_ids, state=state)
             normalized_grad = grad / grad.norm(dim=-1, keepdim=True)
 
+            full_batch_size = self.batch_size * self.n_batches_per_sample
             # Select candidates
             for _ in range(max_retries):
                 # Sample candidates
-                candidates, changed_pos = self.sample_candidates(prompt_ids, normalized_grad, self.batch_size, self.topk)
+                candidates, changed_pos = self.sample_candidates(prompt_ids, normalized_grad, full_batch_size, self.topk)
                 # Filter candidates:
-                candidate_is_valid, valid_candidates_found = self.get_filtered_cands(sigil, candidates, self.batch_size//2)
+                candidate_is_valid, valid_candidates_found = self.get_filtered_cands(sigil, candidates, int(full_batch_size * 0.75))
                 if valid_candidates_found:
                     break
 
             # Search
-            # loss = torch.zeros(len(candidates), dtype=torch.float32, device=self.setup["device"])
-            # print(f"Unique fwd passes: {len(unique_candidates)}")
-            with torch.no_grad():
-                loss = sigil.objective(inputs_embeds=sigil.constraint_embeddings(candidates), state=state).to(dtype=torch.float32).mean(dim=1)
+            losses = []
+            for b in range(0, full_batch_size, self.n_batches_per_sample):
+                with torch.no_grad():
+                    loss = (
+                        sigil.objective(
+                            inputs_embeds=sigil.constraint_embeddings(candidates[b : b + self.n_batches_per_sample]), state=state
+                        )
+                        .to(dtype=torch.float32)
+                        .mean(dim=1)
+                    )
+                    losses.append(loss)
+            loss = torch.concatenate(losses)
 
             # Return best from batch:
             best_candidate, estimated_loss = self.combine_top_p_samples(loss, candidates, changed_pos, candidate_is_valid)
             prompt_ids = best_candidate.unsqueeze(0)
-            
+
             best_candidate = sigil.map_to_tokenizer_ids(prompt_ids)
             if self.top_p == 1 or not self.compute_combined_loss:
                 loss_for_best_candidate = estimated_loss

@@ -1,9 +1,10 @@
 name: igcg
 
 steps: 500
-batch_size: 512
+batch_size: 16
+n_batches_per_sample: 32
 topk: 256
-top_p: 1
+top_p: 3
 filter_cand: True
 compute_combined_loss: False
 
